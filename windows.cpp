@@ -184,6 +184,33 @@ void DisassemblyUpdateLine() {
 	}
 }
 
+uint64_t DisassemblyAddressFromLine(int line) {
+	if (line <= 0 || line > displayCode->lineCount) return 0;
+	const char *text = displayCode->content + displayCode->lines[line - 1].offset;
+	char *end;
+	uint64_t address = strtoul(text, &end, 0);
+	if (end == text || *text != '0' || (text[1] != 'x' && text[1] != 'X')) return 0;
+	return address;
+}
+
+void CommandToggleBreakpointDisassembly(int line) {
+	uint64_t address = DisassemblyAddressFromLine(line);
+	if (!address) return;
+
+	char buffer[128];
+
+	for (int i = 0; i < breakpoints.Length(); i++) {
+		if (breakpoints[i].line == line && breakpoints[i].watchpoint) {
+			StringFormat(buffer, sizeof(buffer), "delete %d", breakpoints[i].number);
+			DebuggerSend(buffer, true, false);
+			return;
+		}
+	}
+
+	StringFormat(buffer, sizeof(buffer), "b *0x%lX", address);
+	DebuggerSend(buffer, true, false);
+}
+
 void CommandToggleDisassembly(void *) {
 	showingDisassembly = !showingDisassembly;
 	autoPrintResultLine = 0;
@@ -191,7 +218,7 @@ void CommandToggleDisassembly(void *) {
 	displayCode->e.flags ^= UI_CODE_NO_MARGIN;
 
 	if (showingDisassembly) {
-		UICodeInsertContent(displayCode, "Disassembly could not be loaded.\nPress Ctrl+D to return to source view.", -1, true);
+		UICodeInsertContent(displayCode, T("Disassembly could not be loaded.\nPress Ctrl+D to return to source view."), -1, true);
 		displayCode->tabSize = 8;
 		DisassemblyLoad();
 		DisassemblyUpdateLine();
@@ -208,7 +235,7 @@ void CommandToggleDisassembly(void *) {
 }
 
 void CommandSetDisassemblyMode(void *) {
-	const char *newMode = UIDialogShow(windowMain, 0, "Select the disassembly mode:\n%b\n%b\n%b", "Disassembly only", "With source", "Source centric");
+	const char *newMode = UIDialogShow(windowMain, 0, T("Select the disassembly mode:\n%b\n%b\n%b"), T("Disassembly only"), T("With source"), T("Source centric"));
 
 	if (0 == strcmp(newMode, "Disassembly only")) disassemblyCommand = "disas";
 	if (0 == strcmp(newMode, "With source"))      disassemblyCommand = "disas /s";
@@ -287,7 +314,7 @@ DISPLAY_CODE_COMMAND_FOR_ALL_BREAKPOINTS_ON_LINE(CommandEnableAllBreakpointsOnLi
 int DisplayCodeMessage(UIElement *element, UIMessage message, int di, void *dp) {
 	UICode *code = (UICode *) element;
 
-	if (message == UI_MSG_CLICKED && !showingDisassembly) {
+	if (message == UI_MSG_CLICKED) {
 		int result = UICodeHitTest(code, element->window->cursorX, element->window->cursorY);
 
 		if (result < 0 && code->leftDownInMargin) {
@@ -323,8 +350,8 @@ int DisplayCodeMessage(UIElement *element, UIMessage message, int di, void *dp) 
 		for (int i = 0; i < breakpoints.Length(); i++) {
 			if (breakpoints[i].line == -result && 0 == strcmp(breakpoints[i].fileFull, currentFileFull)) {
 				UIMenu *menu = UIMenuCreate(&element->window->e, UI_MENU_NO_SCROLL);
-				UIMenuAddItem(menu, 0, "Delete", -1, CommandDeleteAllBreakpointsOnLine, (void *) (intptr_t)-result);
-				UIMenuAddItem(menu, 0, atLeastOneBreakpointEnabled ? "Disable" : "Enable", -1,
+				UIMenuAddItem(menu, 0, T("Delete"), -1, CommandDeleteAllBreakpointsOnLine, (void *) (intptr_t)-result);
+				UIMenuAddItem(menu, 0, (atLeastOneBreakpointEnabled ? T("Disable") : T("Enable")), -1,
 						atLeastOneBreakpointEnabled ? CommandDisableAllBreakpointsOnLine : CommandEnableAllBreakpointsOnLine, 
 						(void *) (intptr_t) -result);
 				UIMenuShow(menu);
@@ -653,7 +680,7 @@ void InspectCurrentLine() {
 	}
 
 	if (!inspectResults.Length()) {
-		inspectResults.Add(strdup("No expressions to display."));
+		inspectResults.Add(strdup(T("No expressions to display.")));
 		inspectResults.Add(strdup(" "));
 		noInspectResults = true;
 	} else {
@@ -805,27 +832,27 @@ int BitmapViewerRefreshMessage(UIElement *element, UIMessage message, int di, vo
 const char *BitmapViewerGetBits(const char *pointerString, const char *widthString, const char *heightString, const char *strideString,
 		uint32_t **_bits, int *_width, int *_height, int *_stride) {
 	const char *widthResult = EvaluateExpression(widthString);
-	if (!widthResult) { return "Could not evaluate width."; }
+	if (!widthResult) { return T("Could not evaluate width."); }
 	int width = atoi(widthResult + 1);
 	const char *heightResult = EvaluateExpression(heightString);
-	if (!heightResult) { return "Could not evaluate height."; }
+	if (!heightResult) { return T("Could not evaluate height."); }
 	int height = atoi(heightResult + 1);
 	int stride = width * 4;
 	const char *pointerResult = EvaluateExpression(pointerString, "/x");
-	if (!pointerResult) { return "Could not evaluate pointer."; }
+	if (!pointerResult) { return T("Could not evaluate pointer."); }
 	char _pointerResult[1024];
 	StringFormat(_pointerResult, sizeof(_pointerResult), "%s", pointerResult);
 	pointerResult = strstr(_pointerResult, " 0x");
-	if (!pointerResult) { return "Pointer to image bits does not look like an address!"; }
+	if (!pointerResult) { return T("Pointer to image bits does not look like an address!"); }
 	pointerResult++;
 
 	if (strideString && *strideString) {
 		const char *strideResult = EvaluateExpression(strideString);
-		if (!strideResult) { return "Could not evaluate stride."; }
+		if (!strideResult) { return T("Could not evaluate stride."); }
 		stride = atoi(strideResult + 1);
 	}
 
-	uint32_t *bits = (uint32_t *) malloc(stride * height * 4); // TODO Is this multiply by 4 necessary?! And the one below.
+	uint32_t *bits = (uint32_t *) malloc(stride * height);
 
 	char bitmapPath[PATH_MAX];
 	realpath(".bitmap.gf", bitmapPath);
@@ -837,13 +864,13 @@ const char *BitmapViewerGetBits(const char *pointerString, const char *widthStri
 	FILE *f = fopen(bitmapPath, "rb");
 
 	if (f) {
-		fread(bits, 1, stride * height * 4, f); // TODO Is this multiply by 4 necessary?!
+		fread(bits, 1, stride * height, f);
 		fclose(f);
 		unlink(bitmapPath);
 	}
 
 	if (!f || strstr(evaluateResult, "access")) {
-		return "Could not read the image bits!";
+		return T("Could not read the image bits!");
 	}
 
 	*_bits = bits, *_width = width, *_height = height, *_stride = stride;
@@ -854,10 +881,10 @@ int BitmapViewerDisplayMessage(UIElement *element, UIMessage message, int di, vo
 	if (message == UI_MSG_RIGHT_UP) {
 		UIMenu *menu = UIMenuCreate(&element->window->e, UI_MENU_NO_SCROLL);
 
-		UIMenuAddItem(menu, 0, "Save to file...", -1, [] (void *cp) {
+		UIMenuAddItem(menu, 0, T("Save to file..."), -1, [] (void *cp) {
 			static char *path = NULL;
-			const char *result = UIDialogShow(windowMain, 0, "Save to file       \nPath:\n%t\n%f%B%C", &path, "Save", "Cancel");
-			if (strcmp(result, "Save")) return;
+			const char *result = UIDialogShow(windowMain, 0, T("Save to file       \nPath:\n%t\n%f%B%C"), &path, T("Save"), T("Cancel"));
+			if (strcmp(result, T("Save"))) return;
 
 			UIImageDisplay *display = (UIImageDisplay *) cp;
 			FILE *f = fopen(path, "wb");
@@ -895,13 +922,13 @@ void BitmapViewerUpdate(const char *pointerString, const char *widthString, cons
 		if (heightString) StringFormat(bitmap->height, sizeof(bitmap->height), "%s", heightString);
 		if (strideString) StringFormat(bitmap->stride, sizeof(bitmap->stride), "%s", strideString);
 
-		UIMDIChild *window = UIMDIChildCreate(&dataWindow->e, UI_MDI_CHILD_CLOSE_BUTTON, UI_RECT_1(0), "Bitmap", -1);
+		UIMDIChild *window = UIMDIChildCreate(&dataWindow->e, UI_MDI_CHILD_CLOSE_BUTTON, UI_RECT_1(0), T("Bitmap"), -1);
 		window->e.messageUser = BitmapViewerWindowMessage;
 		window->e.cp = bitmap;
-		bitmap->autoToggle = UIButtonCreate(&window->e, UI_BUTTON_SMALL | UI_ELEMENT_NON_CLIENT, "Auto", -1);
+		bitmap->autoToggle = UIButtonCreate(&window->e, UI_BUTTON_SMALL | UI_ELEMENT_NON_CLIENT, T("Auto"), -1);
 		bitmap->autoToggle->e.cp = (void *) BitmapViewerAutoUpdateCallback;
 		bitmap->autoToggle->e.messageUser = DataViewerAutoUpdateButtonMessage;
-		UIButtonCreate(&window->e, UI_BUTTON_SMALL | UI_ELEMENT_NON_CLIENT, "Refresh", -1)->e.messageUser = BitmapViewerRefreshMessage;
+		UIButtonCreate(&window->e, UI_BUTTON_SMALL | UI_ELEMENT_NON_CLIENT, T("Refresh"), -1)->e.messageUser = BitmapViewerRefreshMessage;
 		owner = &window->e;
 
 		UIPanel *panel = UIPanelCreate(owner, UI_PANEL_EXPAND);
@@ -928,10 +955,10 @@ void BitmapAddDialog(void *) {
 	static char *pointer = nullptr, *width = nullptr, *height = nullptr, *stride = nullptr;
 
 	const char *result = UIDialogShow(windowMain, 0,
-			"Add bitmap\n\n%l\n\nPointer to bits: (32bpp, RR GG BB AA)\n%t\nWidth:\n%t\nHeight:\n%t\nStride: (optional)\n%t\n\n%l\n\n%f%B%C",
-			&pointer, &width, &height, &stride, "Add", "Cancel");
+			T("Add bitmap\n\n%l\n\nPointer to bits: (32bpp, RR GG BB AA)\n%t\nWidth:\n%t\nHeight:\n%t\nStride: (optional)\n%t\n\n%l\n\n%f%B%C"),
+			&pointer, &width, &height, &stride, T("Add"), T("Cancel"));
 
-	if (0 == strcmp(result, "Add")) {
+	if (0 == strcmp(result, T("Add"))) {
 		BitmapViewerUpdate(pointer, width, height, (stride && stride[0]) ? stride : nullptr);
 	}
 }
@@ -1047,7 +1074,7 @@ UIElement *ConsoleWindowCreate(UIElement *parent) {
 	panel3->gap = 5;
 	trafficLight = UISpacerCreate(&panel3->e, 0, 30, 30);
 	trafficLight->e.messageUser = TrafficLightMessage;
-	UIButton *buttonMenu = UIButtonCreate(&panel3->e, 0, "Menu", -1);
+	UIButton *buttonMenu = UIButtonCreate(&panel3->e, 0, T("Menu"), -1);
 	buttonMenu->invoke = InterfaceShowMenu;
 	buttonMenu->e.cp = buttonMenu;
 	textboxInput = UITextboxCreate(&panel3->e, UI_ELEMENT_H_FILL);
@@ -1509,14 +1536,14 @@ bool WatchGetAddress(Watch *watch) {
 	WatchEvaluate("gf_addressof", watch);
 
 	if (strstr(evaluateResult, "??")) {
-		UIDialogShow(windowMain, 0, "Couldn't get the address of the variable.\n%f%B", "OK");
+		UIDialogShow(windowMain, 0, T("Couldn't get the address of the variable.\n%f%B"), T("OK"));
 		return false;
 	}
 
 	char *end = strstr(evaluateResult, " ");
 
 	if (!end) {
-		UIDialogShow(windowMain, 0, "Couldn't get the address of the variable.\n%f%B", "OK");
+		UIDialogShow(windowMain, 0, T("Couldn't get the address of the variable.\n%f%B"), T("OK"));
 		return false;
 	}
 
@@ -1540,7 +1567,7 @@ void WatchChangeLoggerCreate(WatchWindow *w) {
 	}
 
 	if (!dataTab) {
-		UIDialogShow(windowMain, 0, "The data window is not open.\nThe watch log cannot be created.\n%f%B", "OK");
+		UIDialogShow(windowMain, 0, T("The data window is not open.\nThe watch log cannot be created.\n%f%B"), T("OK"));
 		return;
 	}
 
@@ -1549,10 +1576,10 @@ void WatchChangeLoggerCreate(WatchWindow *w) {
 	}
 
 	char *expressionsToEvaluate = nullptr;
-	const char *result = UIDialogShow(windowMain, 0, "-- Watch logger settings --\nExpressions to evaluate (separate with semicolons):\n%t\n\n%l\n\n%f%B%C",
-			&expressionsToEvaluate, "Start", "Cancel");
+	const char *result = UIDialogShow(windowMain, 0, T("-- Watch logger settings --\nExpressions to evaluate (separate with semicolons):\n%t\n\n%l\n\n%f%B%C"),
+			&expressionsToEvaluate, T("Start"), T("Cancel"));
 
-	if (0 == strcmp(result, "Cancel")) {
+	if (0 == strcmp(result, T("Cancel"))) {
 		free(expressionsToEvaluate);
 		return;
 	}
@@ -1565,13 +1592,13 @@ void WatchChangeLoggerCreate(WatchWindow *w) {
 	char *number = strstr(evaluateResult, "point ");
 
 	if (!number) {
-		UIDialogShow(windowMain, 0, "Couldn't set the watchpoint.\n%f%B", "OK");
+		UIDialogShow(windowMain, 0, T("Couldn't set the watchpoint.\n%f%B"), T("OK"));
 		return;
 	}
 
 	WatchLogger *logger = (WatchLogger *) calloc(1, sizeof(WatchLogger));
 
-	UIButton *button = UIButtonCreate(&child->e, UI_BUTTON_SMALL | UI_ELEMENT_NON_CLIENT, "Resize columns", -1);
+	UIButton *button = UIButtonCreate(&child->e, UI_BUTTON_SMALL | UI_ELEMENT_NON_CLIENT, T("Resize columns"), -1);
 	button->e.cp = logger;
 	button->invoke = WatchLoggerResizeColumns;
 
@@ -1596,7 +1623,7 @@ void WatchChangeLoggerCreate(WatchWindow *w) {
 
 	UISplitPane *panel = UISplitPaneCreate(&child->e, 0, 0.5f);
 	UITable *table = UITableCreate(&panel->e, UI_ELEMENT_H_FILL | UI_ELEMENT_V_FILL, logger->columns);
-	UITable *trace = UITableCreate(&panel->e, UI_ELEMENT_H_FILL | UI_ELEMENT_V_FILL, "Index\tFunction\tLocation\tAddress");
+	UITable *trace = UITableCreate(&panel->e, UI_ELEMENT_H_FILL | UI_ELEMENT_V_FILL, T("Index\tFunction\tLocation\tAddress"));
 
 	logger->id = atoi(number + 6);
 	logger->table = table;
@@ -1613,7 +1640,7 @@ void WatchChangeLoggerCreate(WatchWindow *w) {
 	UIElementRefresh(&dataWindow->e);
 	WatchLoggerResizeColumns(logger);
 
-	UIDialogShow(windowMain, 0, "The log has been setup in the data window.\n%f%B", "OK");
+	UIDialogShow(windowMain, 0, T("The log has been setup in the data window.\n%f%B"), T("OK"));
 	return;
 }
 
@@ -1792,7 +1819,7 @@ void CommandWatchViewSourceAtAddress(void *cp) {
 	if (strstr(evaluateResult, "No line number")) {
 		char *end = strchr(evaluateResult, '\n');
 		if (end) *end = 0;
-		UIDialogShow(windowMain, 0, "%s\n%f%B", evaluateResult, "OK");
+		UIDialogShow(windowMain, 0, "%s\n%f%B", evaluateResult, T("OK"));
 		return;
 	}
 
@@ -1839,9 +1866,9 @@ void CommandWatchSaveAs(void *cp) {
 	if (w->selectedRow == w->rows.Length()) return;
 
 	char *filePath = nullptr;
-	const char *result = UIDialogShow(windowMain, 0, "Path:            \n%t\n%f%B%C", &filePath, "Save", "Cancel");
+	const char *result = UIDialogShow(windowMain, 0, T("Path:            \n%t\n%f%B%C"), &filePath, T("Save"), T("Cancel"));
 
-	if (0 == strcmp(result, "Cancel")) {
+	if (0 == strcmp(result, T("Cancel"))) {
 		free(filePath);
 		return;
 	}
@@ -1850,7 +1877,7 @@ void CommandWatchSaveAs(void *cp) {
 	free(filePath);
 
 	if (!f) {
-		UIDialogShow(windowMain, 0, "Could not open the file for writing!\n%f%B", "OK");
+		UIDialogShow(windowMain, 0, T("Could not open the file for writing!\n%f%B"), T("OK"));
 		return;
 	}
 
@@ -1965,11 +1992,11 @@ int WatchWindowMessage(UIElement *element, UIMessage message, int di, void *dp) 
 			UIMenu *menu = UIMenuCreate(&element->window->e, UI_MENU_NO_SCROLL);
 
 			if (w->mode == WATCH_NORMAL && !w->rows[index]->parent) {
-				UIMenuAddItem(menu, 0, "Edit expression", -1, [] (void *cp) {
+				UIMenuAddItem(menu, 0, T("Edit expression"), -1, [] (void *cp) {
 					WatchCreateTextboxForRow((WatchWindow *) cp, true);
 				}, w);
 
-				UIMenuAddItem(menu, 0, "Delete", -1, [] (void *cp) {
+				UIMenuAddItem(menu, 0, T("Delete"), -1, [] (void *cp) {
 					WatchWindow *w = (WatchWindow *) cp;
 					WatchDeleteExpression(w);
 					UIElementRefresh(w->element->parent);
@@ -1977,13 +2004,13 @@ int WatchWindowMessage(UIElement *element, UIMessage message, int di, void *dp) 
 				}, w);
 			}
 
-			UIMenuAddItem(menu, 0, "Copy value to clipboard\tCtrl+C", -1, CommandWatchCopyValueToClipboard, w);
+			UIMenuAddItem(menu, 0, T("Copy value to clipboard\tCtrl+C"), -1, CommandWatchCopyValueToClipboard, w);
 
-			UIMenuAddItem(menu, 0, "Log writes to address...", -1, [] (void *cp) {
+			UIMenuAddItem(menu, 0, T("Log writes to address..."), -1, [] (void *cp) {
 				WatchChangeLoggerCreate((WatchWindow *) cp);
 			}, w);
 
-			UIMenuAddItem(menu, 0, "Break on writes to address", -1, [] (void *cp) {
+			UIMenuAddItem(menu, 0, T("Break on writes to address"), -1, [] (void *cp) {
 				WatchWindow *w = (WatchWindow *) cp;
 				if (w->selectedRow == w->rows.Length()) return;
 				if (!WatchGetAddress(w->rows[w->selectedRow])) return;
@@ -1993,11 +2020,11 @@ int WatchWindowMessage(UIElement *element, UIMessage message, int di, void *dp) 
 			}, w);
 
 			if (firstWatchWindow) {
-				UIMenuAddItem(menu, 0, "Add entry for address\tCtrl+E", -1, CommandWatchAddEntryForAddress, w);
+				UIMenuAddItem(menu, 0, T("Add entry for address\tCtrl+E"), -1, CommandWatchAddEntryForAddress, w);
 			}
 
-			UIMenuAddItem(menu, 0, "View source at address\tCtrl+G", -1, CommandWatchViewSourceAtAddress, w);
-			UIMenuAddItem(menu, 0, "Save as...", -1, CommandWatchSaveAs, w);
+			UIMenuAddItem(menu, 0, T("View source at address\tCtrl+G"), -1, CommandWatchViewSourceAtAddress, w);
+			UIMenuAddItem(menu, 0, T("Save as..."), -1, CommandWatchSaveAs, w);
 
 			UIMenuShow(menu);
 		}
@@ -2293,6 +2320,22 @@ void CommandAddWatch(void *) {
 // Stack window:
 //////////////////////////////////////////////////////
 
+void StackEnsureRowVisible(UIElement *element, int index) {
+	UITable *table = (UITable *) element;
+	if (index < 0 || index >= table->itemCount) return;
+
+	int rowHeight = UIMeasureStringHeight();
+	int start = index * rowHeight, end = start + rowHeight;
+	int page = (int) table->vScroll->page;
+	int position = (int) table->vScroll->position;
+
+	if (end > position + page) table->vScroll->position = end - page;
+	else if (start < position) table->vScroll->position = start;
+	else return;
+
+	UIElementRefresh(element);
+}
+
 void StackSetFrame(UIElement *element, int index) {
 	if (index >= 0 && index < ((UITable *) element)->itemCount && stackSelected != index) {
 		char buffer[64];
@@ -2326,7 +2369,7 @@ int TableStackMessage(UIElement *element, UIMessage message, int di, void *dp) {
 
 		if (m->code == UI_KEYCODE_UP || m->code == UI_KEYCODE_DOWN) {
 			StackSetFrame(element, stackSelected + (m->code == UI_KEYCODE_UP ? -1 : 1));
-			// TODO Scroll the row into view if necessary.
+			StackEnsureRowVisible(element, stackSelected);
 			return 1;
 		}
 	}
@@ -2335,7 +2378,7 @@ int TableStackMessage(UIElement *element, UIMessage message, int di, void *dp) {
 }
 
 UIElement *StackWindowCreate(UIElement *parent) {
-	UITable *table = UITableCreate(parent, 0, "Index\tFunction\tLocation\tAddress");
+	UITable *table = UITableCreate(parent, 0, T("Index\tFunction\tLocation\tAddress"));
 	table->e.messageUser = TableStackMessage;
 	return &table->e;
 }
@@ -2423,12 +2466,12 @@ int TableBreakpointsMessage(UIElement *element, UIMessage message, int di, void 
 				}
 
 				addMenuItems:
-				UIMenuAddItem(menu, 0, "Delete", -1, CommandDeleteSelectedBreakpoints, data);
-				UIMenuAddItem(menu, 0, atLeastOneBreakpointDisabled ? "Enable" : "Disable", -1,
+				UIMenuAddItem(menu, 0, T("Delete"), -1, CommandDeleteSelectedBreakpoints, data);
+				UIMenuAddItem(menu, 0, (atLeastOneBreakpointDisabled ? T("Enable") : T("Disable")), -1,
 						atLeastOneBreakpointDisabled ? CommandEnableSelectedBreakpoints : CommandDisableSelectedBreakpoints, data);
 			} else {
-				UIMenuAddItem(menu, 0, "Delete", -1, CommandDeleteBreakpoint, (void *) (intptr_t) index);
-				UIMenuAddItem(menu, 0, breakpoints[index].enabled ? "Disable" : "Enable", -1,
+				UIMenuAddItem(menu, 0, T("Delete"), -1, CommandDeleteBreakpoint, (void *) (intptr_t) index);
+				UIMenuAddItem(menu, 0, (breakpoints[index].enabled ? T("Disable") : T("Enable")), -1,
 						breakpoints[index].enabled ? CommandDisableBreakpoint : CommandEnableBreakpoint, (void *) (intptr_t) index);
 			}
 
@@ -2484,7 +2527,7 @@ int TableBreakpointsMessage(UIElement *element, UIMessage message, int di, void 
 }
 
 UIElement *BreakpointsWindowCreate(UIElement *parent) {
-	UITable *table = UITableCreate(parent, 0, "File\tLine\tEnabled\tCondition\tHit");
+	UITable *table = UITableCreate(parent, 0, T("File\tLine\tEnabled\tCondition\tHit"));
 	table->e.cp = (BreakpointTableData *) calloc(1, sizeof(BreakpointTableData));
 	table->e.messageUser = TableBreakpointsMessage;
 	return &table->e;
@@ -2536,7 +2579,7 @@ void CommandToggleFillDataTab(void *) {
 UIElement *DataWindowCreate(UIElement *parent) {
 	dataTab = UIPanelCreate(parent, UI_PANEL_EXPAND);
 	UIPanel *panel5 = UIPanelCreate(&dataTab->e, UI_PANEL_COLOR_1 | UI_PANEL_HORIZONTAL | UI_PANEL_SMALL_SPACING);
-	buttonFillWindow = UIButtonCreate(&panel5->e, UI_BUTTON_SMALL, "Fill window", -1);
+	buttonFillWindow = UIButtonCreate(&panel5->e, UI_BUTTON_SMALL, T("Fill window"), -1);
 	buttonFillWindow->invoke = CommandToggleFillDataTab;
 
 	for (int i = 0; i < interfaceDataViewers.Length(); i++) {
@@ -2588,7 +2631,7 @@ UIElement *StructWindowCreate(UIElement *parent) {
 	window->textbox->e.messageUser = TextboxStructNameMessage;
 	window->textbox->e.cp = window;
 	window->display = UICodeCreate(&panel->e, UI_ELEMENT_V_FILL | UI_CODE_NO_MARGIN | UI_CODE_SELECTABLE);
-	UICodeInsertContent(window->display, "Type the name of a struct to view its layout.", -1, false);
+	UICodeInsertContent(window->display, T("Type the name of a struct to view its layout."), -1, false);
 	return &panel->e;
 }
 
@@ -2711,9 +2754,9 @@ UIElement *FilesWindowCreate(UIElement *parent) {
 	window->panel->e.cp = window;
 	UIPanel *row = UIPanelCreate(&container->e, UI_PANEL_COLOR_2 | UI_PANEL_HORIZONTAL | UI_PANEL_SMALL_SPACING);
 	UIButton *button;
-	button = UIButtonCreate(&row->e, UI_BUTTON_SMALL, "-> cwd", -1);
+	button = UIButtonCreate(&row->e, UI_BUTTON_SMALL, T("-> cwd"), -1);
 	button->e.cp = window, button->invoke = FilesNavigateToCWD;
-	button = UIButtonCreate(&row->e, UI_BUTTON_SMALL, "-> active file", -1);
+	button = UIButtonCreate(&row->e, UI_BUTTON_SMALL, T("-> active file"), -1);
 	button->e.cp = window, button->invoke = FilesNavigateToActiveFile;
 	window->path = UILabelCreate(&row->e, UI_ELEMENT_H_FILL, "", 0);
 	FilesNavigateToCWD(window);
@@ -2813,7 +2856,7 @@ void RegistersWindowUpdate(const char *, UIElement *panel) {
 
 UIElement *CommandsWindowCreate(UIElement *parent) {
 	UIPanel *panel = UIPanelCreate(parent, UI_PANEL_COLOR_1 | UI_PANEL_SMALL_SPACING | UI_PANEL_EXPAND | UI_PANEL_SCROLL);
-	if (!presetCommands.Length()) UILabelCreate(&panel->e, 0, "No preset commands found in config file!", -1);
+	if (!presetCommands.Length()) UILabelCreate(&panel->e, 0, T("No preset commands found in config file!"), -1);
 
 	for (int i = 0; i < presetCommands.Length(); i++) {
 		char buffer[256];
@@ -2919,7 +2962,7 @@ int ThreadTableMessage(UIElement *element, UIMessage message, int di, void *dp) 
 }
 
 UIElement *ThreadWindowCreate(UIElement *parent) {
-	UITable *table = UITableCreate(parent, 0, "ID\tName\tFrame");
+	UITable *table = UITableCreate(parent, 0, T("ID\tName\tFrame"));
 	table->e.cp = (ThreadWindow *) calloc(1, sizeof(ThreadWindow));
 	table->e.messageUser = ThreadTableMessage;
 	return &table->e;
@@ -2987,7 +3030,7 @@ void ExecutableWindowStartOrRun(ExecutableWindow *window, bool pause) {
 	EvaluateCommand(buffer);
 
 	if (strstr(evaluateResult, "No such file or directory.")) {
-		UIDialogShow(windowMain, 0, "The executable path is invalid.\n%f%B", "OK");
+		UIDialogShow(windowMain, 0, T("The executable path is invalid.\n%f%B"), T("OK"));
 		return;
 	}
 
@@ -3019,7 +3062,7 @@ void ExecutableWindowSaveButton(void *_window) {
 	FILE *f = fopen(localConfigPath, "rb");
 
 	if (f) {
-		const char *result = UIDialogShow(windowMain, 0, ".project.gf already exists in the current directory.\n%f%B%C", "Overwrite", "Cancel");
+		const char *result = UIDialogShow(windowMain, 0, T(".project.gf already exists in the current directory.\n%f%B%C"), T("Overwrite"), T("Cancel"));
 		if (strcmp(result, "Overwrite")) return;
 		fclose(f);
 	}
@@ -3031,30 +3074,30 @@ void ExecutableWindowSaveButton(void *_window) {
 			window->askDirectory->check == UI_CHECK_CHECKED ? '1' : '0');
 	fclose(f);
 	SettingsAddTrustedFolder();
-	UIDialogShow(windowMain, 0, "Saved executable settings!\n%f%B", "OK");
+	UIDialogShow(windowMain, 0, T("Saved executable settings!\n%f%B"), T("OK"));
 }
 
 UIElement *ExecutableWindowCreate(UIElement *parent) {
 	ExecutableWindow *window = (ExecutableWindow *) calloc(1, sizeof(ExecutableWindow));
 	UIPanel *panel = UIPanelCreate(parent, UI_PANEL_COLOR_1 | UI_PANEL_EXPAND);
-	UILabelCreate(&panel->e, 0, "Path to executable:", -1);
+	UILabelCreate(&panel->e, 0, T("Path to executable:"), -1);
 	window->path = UITextboxCreate(&panel->e, 0);
 	UITextboxReplace(window->path, executablePath, -1, false);
-	UILabelCreate(&panel->e, 0, "Command line arguments:", -1);
+	UILabelCreate(&panel->e, 0, T("Command line arguments:"), -1);
 	window->arguments = UITextboxCreate(&panel->e, 0);
 	UITextboxReplace(window->arguments, executableArguments, -1, false);
-	window->askDirectory = UICheckboxCreate(&panel->e, 0, "Ask GDB for working directory", -1);
+	window->askDirectory = UICheckboxCreate(&panel->e, 0, T("Ask GDB for working directory"), -1);
 	window->askDirectory->check = executableAskDirectory ? UI_CHECK_CHECKED : UI_CHECK_UNCHECKED;
 	UIPanel *row = UIPanelCreate(&panel->e, UI_PANEL_HORIZONTAL);
 	UIButton *button;
-	button = UIButtonCreate(&row->e, 0, "Run", -1);
+	button = UIButtonCreate(&row->e, 0, T("Run"), -1);
 	button->e.cp = window;
 	button->invoke = ExecutableWindowRunButton;
-	button = UIButtonCreate(&row->e, 0, "Start", -1);
+	button = UIButtonCreate(&row->e, 0, T("Start"), -1);
 	button->e.cp = window;
 	button->invoke = ExecutableWindowStartButton;
 	UISpacerCreate(&row->e, 0, 10, 0);
-	button = UIButtonCreate(&row->e, 0, "Save to .project.gf", -1);
+	button = UIButtonCreate(&row->e, 0, T("Save to .project.gf"), -1);
 	button->e.cp = window;
 	button->invoke = ExecutableWindowSaveButton;
 	return &panel->e;
@@ -3138,7 +3181,7 @@ int TextboxSearchCommandMessage(UIElement *element, UIMessage message, int di, v
 		}
 
 		if (firstMatch) {
-			UICodeInsertContent(window->display, "(no matches)", -1, firstMatch);
+			UICodeInsertContent(window->display, T("(no matches)"), -1, firstMatch);
 		}
 
 		window->display->vScroll->position = 0;
@@ -3155,7 +3198,7 @@ UIElement *CommandSearchWindowCreate(UIElement *parent) {
 	window->textbox->e.messageUser = TextboxSearchCommandMessage;
 	window->textbox->e.cp = window;
 	window->display = UICodeCreate(&panel->e, UI_ELEMENT_V_FILL | UI_CODE_NO_MARGIN | UI_CODE_SELECTABLE);
-	UICodeInsertContent(window->display, "Type here to search \nGDB command descriptions.", -1, true);
+	UICodeInsertContent(window->display, T("Type here to search \nGDB command descriptions."), -1, true);
 	return &panel->e;
 }
 

@@ -1,14 +1,3 @@
-// TODO Disassembly window:
-// 	- Setting/clearing/showing breakpoints.
-// 	- Jump/run to line.
-// 	- Shift+F10: run to next instruction (for skipping past loops).
-
-// TODO Inspect line mode:
-// 	- Jump/run to selected line.
-// 	- How to show overloaded variables correctly when moving lines?
-
-// TODO More data visualization tools in the data window.
-
 #include <stdint.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -22,6 +11,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <time.h>
+#include <sys/wait.h>
 
 #ifdef __APPLE__
 #include <sys/syslimits.h>
@@ -36,35 +26,36 @@ extern "C" {
 #include "luigi2.h"
 }
 
-// TODO: gruber darker theme for my own
+#include "i18n.h"
+
 UITheme uiThemeGruberDarker = {
-    .panel1 = 0xFF262626,
-    .panel2 = 0xFF181818,
+    .panel1 = 0xFF1E1E1E,
+    .panel2 = 0xFF151515,
     .selected = 0xFFFFD866,
     .border = 0xFF000000,
 
-    .text = 0xFFE4E4E4,
-    .textDisabled = 0xFF535353,
-    .textSelected = 0xFF181818,
+    .text = 0xFFEDEDED,
+    .textDisabled = 0xFF666666,
+    .textSelected = 0xFF151515,
 
-    .buttonNormal = 0xFF2C2C2C,
-    .buttonHovered = 0xFF3A3A3A,
-    .buttonPressed = 0xFF101010,
-    .buttonDisabled = 0xFF1F1F1F,
+    .buttonNormal = 0xFF2A2A2A,
+    .buttonHovered = 0xFF404040,
+    .buttonPressed = 0xFF161616,
+    .buttonDisabled = 0xFF202020,
 
-    .textboxNormal = 0xFF242424,
-    .textboxFocused = 0xFF353535,
+    .textboxNormal = 0xFF222222,
+    .textboxFocused = 0xFF383838,
 
-    .codeFocused = 0xFF353535,
-    .codeBackground = 0xFF181818,
-    .codeDefault = 0xFFE4E4E4,
-    .codeComment = 0xFF535353,
+    .codeFocused = 0xFF383838,
+    .codeBackground = 0xFF151515,
+    .codeDefault = 0xFFEDEDED,
+    .codeComment = 0xFF7A7A7A,
     .codeString = 0xFFFFD866,
     .codeNumber = 0xFFA9DC76,
     .codeOperator = 0xFFFC9867,
     .codePreprocessor = 0xFFFF6188,
 
-    .accent1 = 0xFF4242,
+    .accent1 = 0xFFC24242,
     .accent2 = 0xA9DC76,
 };
 
@@ -167,6 +158,7 @@ struct InterfaceCommand {
 
 struct InterfaceWindow {
 	const char *name;
+	const char *displayName;
 	UIElement *(*create)(UIElement *parent);
 	void (*update)(const char *data, UIElement *element);
 	void (*focus)(UIElement *element);
@@ -193,7 +185,7 @@ struct ReceiveMessageType {
 FILE *commandLog;
 char emptyString;
 bool programRunning = true;
-bool vimServerEnabled = true;
+bool vimServerEnabled = false;
 const char *vimServerName = "GVIM";
 const char *logPipePath;
 const char *controlPipePath;
@@ -210,9 +202,6 @@ Array<InterfaceDataViewer> interfaceDataViewers;
 Array<ReceiveMessageType> receiveMessageTypes;
 char *layoutString = (char *) "v(75,h(80,Source,v(50,t(Exe,Breakpoints,Commands,Struct),t(Stack,Files,Thread,CmdSearch))),h(65,Console,t(Watch,Locals,Registers,Data)))";
 const char *fontPath;
-// int fontSizeCode = 13;
-// int fontSizeInterface = 11;
-// TODO: Bigger size font for my own
 int fontSizeCode = 13;
 int fontSizeInterface = 18;
 
@@ -384,6 +373,8 @@ UIElement *InterfaceWindowSwitchToAndFocus(const char *name);
 void WatchAddExpression2(char *string);
 int WatchWindowMessage(UIElement *element, UIMessage message, int di, void *dp);
 void CommandInspectLine(void *);
+void CommandLanguageSetup(void *);
+void CommandToggleBreakpointDisassembly(int line);
 void WatchRewrite(const char *expression);
 void CopyLayoutToClipboard(void *cp);
 
@@ -395,12 +386,28 @@ int StringFormat(char *buffer, size_t bufferSize, const char *format, ...) {
 	va_list arguments;
 
 	va_start(arguments, format);
-	size_t length = vsnprintf(buffer, bufferSize, format, arguments);
+	int length = vsnprintf(buffer, bufferSize, format, arguments);
 	va_end(arguments);
 
-	if (length > bufferSize) {
-		// HACK This could truncate a UTF-8 codepoint.
-		length = bufferSize;
+	if (length < 0) return -1;
+
+	if ((size_t) length >= bufferSize && bufferSize >= 2) {
+		// vsnprintf wrote at most bufferSize-1 bytes plus a NUL at buffer[bufferSize-1].
+		// If the last codepoint is split, drop its partial bytes.
+		size_t end = bufferSize - 1;
+		size_t lead = end - 1;
+		while (lead > 0 && ((uint8_t) buffer[lead] & 0xC0) == 0x80) lead--;
+
+		uint8_t c = (uint8_t) buffer[lead];
+		size_t expected = (c & 0xE0) == 0xC0 ? 2
+			: (c & 0xF0) == 0xE0 ? 3
+			: (c & 0xF8) == 0xF0 ? 4 : 1;
+
+		if (lead + expected > end) {
+			end = lead;
+			buffer[end] = 0;
+		}
+		length = (int) end;
 	}
 
 	return length;
@@ -549,13 +556,24 @@ bool SourceFindOuterFunctionCall(char **start, char **end) {
 	offset--;
 
 	// Look backwards for the start of the function name.
-	// TODO Support function pointers.
+	// Also recognize function pointer calls like `(*func)(...)` or `obj->cb(...)`.
 
 	while (offset > 0) {
 		char c = displayCode->content[offset];
 
-		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == ' ' || (c >= '0' && c <= '9')) {
-			// Part of the function name.
+		if (c == ')') {
+			// Skip over the parenthesized part of a function pointer expression.
+			int level = 0;
+			while (offset > 0) {
+				if (displayCode->content[offset] == ')') level++;
+				else if (displayCode->content[offset] == '(' && --level == 0) { offset--; break; }
+				offset--;
+			}
+			continue;
+		}
+
+		if (isalnum((unsigned char) c) || c == '_' || c == ' ' || c == '*'
+				|| c == ':' || c == '.' || c == '[' || c == ']' || c == '-' || c == '>') {
 			offset--;
 		} else {
 			*start = displayCode->content + offset + 1;
@@ -564,6 +582,8 @@ bool SourceFindOuterFunctionCall(char **start, char **end) {
 		}
 	}
 
+	if (offset == 0) *start = displayCode->content;
+	found = true;
 	return found;
 }
 
@@ -580,6 +600,7 @@ UIMessage ReceiveMessageRegister(void (*callback)(char *input)) {
 volatile int pipeToGDB;
 volatile pid_t gdbPID;
 volatile pthread_t gdbThread;
+volatile bool debuggerStopRequested = false;
 pthread_cond_t evaluateEvent;
 pthread_mutex_t evaluateMutex;
 char *evaluateResult;
@@ -632,17 +653,26 @@ void *DebuggerThread(void *) {
 
 	pipeToGDB = inputPipe[1];
 
+	// Close the ends only the child needs. Keeping outputPipe[1] open in the
+	// parent prevents read() from ever seeing EOF when GDB exits, which would
+	// make pthread_join hang on shutdown.
+	close(outputPipe[1]);
+	close(inputPipe[0]);
+
 	write(pipeToGDB, initialGDBCommand, strlen(initialGDBCommand));
 
 	char *catBuffer = NULL;
 	size_t catBufferUsed = 0;
 	size_t catBufferAllocated = 0;
 
-	while (true) {
+	while (!debuggerStopRequested) {
+		struct pollfd descriptor = { outputPipe[0], POLLIN, 0 };
+		if (poll(&descriptor, 1, 100) <= 0) continue;
+
 		char buffer[512 + 1];
 		int count = read(outputPipe[0], buffer, 512);
+		if (count <= 0) break;
 		buffer[count] = 0;
-		if (!count) break;
 
 		if (sendAllGDBOutputToLogWindowContext && !evaluateMode) {
 			void *message = malloc(count + sizeof(sendAllGDBOutputToLogWindowContext) + 1);
@@ -687,6 +717,7 @@ void *DebuggerThread(void *) {
 }
 
 void DebuggerStartThread() {
+	debuggerStopRequested = false;
 	pthread_t debuggerThread;
 	pthread_attr_t attributes;
 	pthread_attr_init(&attributes);
@@ -759,9 +790,29 @@ const char *EvaluateExpression(const char *expression, const char *format = null
 	return nullptr;
 }
 
+void DebuggerStopThread() {
+	debuggerStopRequested = true;
+
+	if (gdbPID > 0) {
+		if (pipeToGDB) write(pipeToGDB, "quit\n", 5);
+		kill(gdbPID, SIGKILL);
+		waitpid(gdbPID, nullptr, 0);
+		gdbPID = 0;
+	}
+
+	if (gdbThread) {
+		pthread_join(gdbThread, nullptr);
+		gdbThread = 0;
+	}
+
+	if (pipeToGDB) {
+		close(pipeToGDB);
+		pipeToGDB = 0;
+	}
+}
+
 void DebuggerClose() {
-	kill(gdbPID, SIGKILL);
-	pthread_cancel(gdbThread);
+	DebuggerStopThread();
 }
 
 void *ControlPipeThread(void *) {
@@ -980,7 +1031,43 @@ void TabCompleterRun(TabCompleter *completer, UITextbox *textbox, bool lastKeyWa
 // Commands:
 //////////////////////////////////////////////////////
 
+void CommandRunShell(const char *command) {
+	char buffer[4096];
+	StringFormat(buffer, 4096, T("Running shell command \"%s\"...\n"), command);
+	if (displayOutput) UICodeInsertContent(displayOutput, buffer, -1, false);
+	StringFormat(buffer, 4096, "%s > .output.gf 2>&1", command);
+	int start = time(nullptr);
+	int result = system(buffer);
+	size_t bytes = 0;
+	char *output = LoadFile(".output.gf", &bytes);
+	unlink(".output.gf");
+	char *copy = (char *) malloc(bytes + 1);
+	uintptr_t j = 0;
+
+	for (uintptr_t i = 0; i <= bytes;) {
+		if ((uint8_t) output[i] == 0xE2 && (uint8_t) output[i + 1] == 0x80
+				&& ((uint8_t) output[i + 2] == 0x98 || (uint8_t) output[i + 2] == 0x99)) {
+			copy[j++] = '\'';
+			i += 3;
+		} else {
+			copy[j++] = output[i++];
+		}
+	}
+	copy[j] = 0;
+
+	if (displayOutput) UICodeInsertContent(displayOutput, copy, j, false);
+	free(output);
+	free(copy);
+	StringFormat(buffer, 4096, T("(exit code: %d; time: %ds)\n"), result, (int) (time(nullptr) - start));
+	if (displayOutput) UICodeInsertContent(displayOutput, buffer, -1, false);
+	if (displayOutput) UIElementRefresh(&displayOutput->e);
+}
+
 bool CommandParseInternal(const char *command, bool synchronous) {
+	if (0 == memcmp(command, "shell ", 6)) {
+		CommandRunShell(command);
+		return true;
+	}
 	if (0 == strcmp(command, "gf-step")) {
 		if (!programRunning) DebuggerSend(showingDisassembly ? "stepi" : "s", true, synchronous);
 		return true;
@@ -1020,8 +1107,7 @@ bool CommandParseInternal(const char *command, bool synchronous) {
 		}
 
 		firstUpdate = true;
-		kill(gdbPID, SIGKILL);
-		pthread_cancel(gdbThread); // TODO Is there a nicer way to do this?
+		DebuggerStopThread();
 		DebuggerStartThread();
 	} else if (0 == strcmp(command, "gf-get-pwd")) {
 		EvaluateCommand("info source");
@@ -1043,7 +1129,7 @@ bool CommandParseInternal(const char *command, bool synchronous) {
 			}
 		}
 
-		UIDialogShow(windowMain, 0, "Couldn't get the working directory.\n%f%B", "OK");
+		UIDialogShow(windowMain, 0, T("Couldn't get the working directory.\n%f%B"), T("OK"));
 	} else if (strlen(command) > 13 && 0 == memcmp(command, "gf-switch-to ", 13)) {
 		InterfaceWindowSwitchToAndFocus(command + 13);
 	} else if (strlen(command) > 11 && 0 == memcmp(command, "gf-command ", 11)) {
@@ -1073,9 +1159,9 @@ bool CommandParseInternal(const char *command, bool synchronous) {
 	} else if (strlen(command) > 17 && 0 == memcmp(command, "gf-rewrite-watch ", 17)) {
 		WatchRewrite(command + 17);
 	} else if (0 == strcmp(command, "target remote :1234") && confirmCommandConnect
-			&& 0 == strcmp("Cancel", UIDialogShow(windowMain, 0, "Connect to remote target?\n%f%B%C", "Connect", "Cancel"))) {
+			&& 0 == strcmp(T("Cancel"), UIDialogShow(windowMain, 0, T("Connect to remote target?\n%f%B%C"), T("Connect"), T("Cancel")))) {
 	} else if (0 == strcmp(command, "kill") && confirmCommandKill
-			&& 0 == strcmp("Cancel", UIDialogShow(windowMain, 0, "Kill debugging target?\n%f%B%C", "Kill", "Cancel"))) {
+			&& 0 == strcmp(T("Cancel"), UIDialogShow(windowMain, 0, T("Kill debugging target?\n%f%B%C"), T("Kill"), T("Cancel")))) {
 	} else {
 		DebuggerSend(command, true, synchronous);
 		return true;
@@ -1107,7 +1193,7 @@ void CommandPause(void *) {
 
 void CommandSyncWithGvim(void *) {
 	char buffer[1024];
-	StringFormat(buffer, sizeof(buffer), "vim --servername %s --remote-expr \"execute(\\\"ls\\\")\" | grep %%", vimServerName);
+	StringFormat(buffer, sizeof(buffer), "vim --servername %s --remote-expr \"execute(\\\"ls\\\")\" 2>/dev/null | grep %%", vimServerName);
 	FILE *file = popen(buffer, "r");
 	if (!file) return;
 	buffer[fread(buffer, 1, 1023, file)] = 0;
@@ -1125,7 +1211,7 @@ void CommandSyncWithGvim(void *) {
 
 	if (name[0] != '/' && name[0] != '~') {
 		char buffer[1024];
-		StringFormat(buffer, sizeof(buffer), "vim --servername %s --remote-expr \"execute(\\\"pwd\\\")\" | grep '/'", vimServerName);
+		StringFormat(buffer, sizeof(buffer), "vim --servername %s --remote-expr \"execute(\\\"pwd\\\")\" 2>/dev/null | grep '/'", vimServerName);
 		FILE *file = popen(buffer, "r");
 		if (!file) return;
 		buffer[fread(buffer, 1, 1023, file)] = 0;
@@ -1144,7 +1230,7 @@ void CommandToggleBreakpoint(void *_line) {
 	int line = (int) (intptr_t) _line;
 
 	if (showingDisassembly) {
-		// TODO.
+		CommandToggleBreakpointDisassembly(line ? line : currentLine);
 		return;
 	}
 
@@ -1168,41 +1254,7 @@ void CommandToggleBreakpoint(void *_line) {
 
 void CommandCustom(void *_command) {
 	const char *command = (const char *) _command;
-
-	if (0 == memcmp(command, "shell ", 6)) {
-		// TODO Move this into CommandParseInternal?
-
-		char buffer[4096];
-		StringFormat(buffer, 4096, "Running shell command \"%s\"...\n", command);
-		if (displayOutput) UICodeInsertContent(displayOutput, buffer, -1, false);
-		StringFormat(buffer, 4096, "%s > .output.gf 2>&1", command);
-		int start = time(nullptr);
-		int result = system(buffer);
-		size_t bytes = 0;
-		char *output = LoadFile(".output.gf", &bytes);
-		unlink(".output.gf");
-		char *copy = (char *) malloc(bytes + 1);
-		uintptr_t j = 0;
-
-		for (uintptr_t i = 0; i <= bytes;) {
-			if ((uint8_t) output[i] == 0xE2 && (uint8_t) output[i + 1] == 0x80
-					&& ((uint8_t) output[i + 2] == 0x98 || (uint8_t) output[i + 2] == 0x99)) {
-				copy[j++] = '\'';
-				i += 3;
-			} else {
-				copy[j++] = output[i++];
-			}
-		}
-
-		if (displayOutput) UICodeInsertContent(displayOutput, copy, j, false);
-		free(output);
-		free(copy);
-		StringFormat(buffer, 4096, "(exit code: %d; time: %ds)\n", result, (int) (time(nullptr) - start));
-		if (displayOutput) UICodeInsertContent(displayOutput, buffer, -1, false);
-		if (displayOutput) UIElementRefresh(&displayOutput->e);
-	} else {
-		CommandParseInternal(command, false);
-	}
+	CommandParseInternal(command, false);
 }
 
 //////////////////////////////////////////////////////
@@ -1247,6 +1299,93 @@ void SettingsAddTrustedFolder() {
 		if (length - insert) fwrite(config + insert, 1, length - insert, f);
 		fclose(f);
 	}
+}
+
+void SettingsSetValue(const char *section, const char *key, const char *value) {
+	char *config = LoadFile(globalConfigPath, nullptr);
+	size_t capacity = (config ? strlen(config) : 0) + strlen(section) + strlen(key) + strlen(value) + 512;
+	char *output = (char *) malloc(capacity);
+	output[0] = 0;
+	size_t used = 0;
+	auto append = [&](const char *format, const char *a, const char *b) {
+		int n = snprintf(output + used, capacity - used, format, a, b);
+		if (n > 0) used += (size_t) n < capacity - used ? (size_t) n : capacity - used - 1;
+	};
+
+	char sectionHeader[256];
+	StringFormat(sectionHeader, sizeof(sectionHeader), "[%s]", section);
+
+	bool inSection = false, wroteKey = false;
+	char *position = config;
+	while (position && *position) {
+		char *end = strchr(position, '\n');
+		if (end) *end = 0;
+
+		if (position[0] == '[') {
+			if (inSection && !wroteKey) {
+				append("%s=%s\n", key, value);
+				wroteKey = true;
+			}
+			inSection = 0 == strcmp(position, sectionHeader);
+			append("%s\n", position, "");
+		} else if (!*position) {
+			append("\n", "", "");
+		} else if (inSection) {
+			char *separator = strchr(position, '=');
+			if (separator) *separator = 0;
+			if (0 == strcmp(position, key)) {
+				append("%s=%s\n", key, value);
+				wroteKey = true;
+			} else {
+				append("%s=%s\n", position, separator ? separator + 1 : "");
+			}
+		} else {
+			append("%s\n", position, "");
+		}
+
+		if (!end) break;
+		position = end + 1;
+	}
+
+	if (inSection && !wroteKey) {
+		append("%s=%s\n", key, value);
+		wroteKey = true;
+	}
+	if (!wroteKey) {
+		append("\n[%s]\n", section, "");
+		append("%s=%s\n", key, value);
+	}
+
+	FILE *f = fopen(globalConfigPath, "wb");
+	if (f) {
+		fwrite(output, 1, used, f);
+		fclose(f);
+	}
+
+	free(output);
+	free(config);
+}
+
+void CommandLanguageSetup(void *) {
+	const char *english = "English", *chinese = "简体中文", *japanese = "日本語", *cancel = T("Cancel");
+	struct Languages { const char *code, *label; } languages[] = {
+		{ "en", english }, { "zh", chinese }, { "ja", japanese },
+	};
+
+	const char *result = UIDialogShow(windowMain, 0, T("Select language:\n%f%B%b%b%C"),
+			english, chinese, japanese, T("Cancel"));
+
+	if (0 == strcmp(result, cancel)) return;
+
+	for (uintptr_t i = 0; i < sizeof(languages) / sizeof(languages[0]); i++) {
+		if (0 == strcmp(result, languages[i].label)) {
+			i18n_set_lang(languages[i].code);
+			SettingsSetValue("ui", "language", i18n_get_lang());
+			break;
+		}
+	}
+
+	UIDialogShow(windowMain, 0, T("Language changed. Some labels update after restarting gf2.\n%f%B"), T("OK"));
 }
 
 void SettingsLoad(bool earlyPass) {
@@ -1320,7 +1459,9 @@ void SettingsLoad(bool earlyPass) {
 					UIWindowRegisterShortcut(windowMain, shortcut);
 				}
 			} else if (0 == strcmp(state.section, "ui") && earlyPass) {
-				if (0 == strcmp(state.key, "font_path")) {
+				if (0 == strcmp(state.key, "language")) {
+					i18n_set_lang(state.value);
+				} else if (0 == strcmp(state.key, "font_path")) {
 					fontPath = state.value;
 				} else if (0 == strcmp(state.key, "font_size")) {
 					fontSizeInterface = fontSizeCode = atoi(state.value);
@@ -1544,24 +1685,24 @@ void MsgReceivedControl(char *input) {
 
 __attribute__((constructor))
 void InterfaceAddBuiltinWindowsAndCommands() {
-	interfaceWindows.Add({ "Stack", StackWindowCreate, StackWindowUpdate });
-	interfaceWindows.Add({ "Source", SourceWindowCreate, SourceWindowUpdate });
-	interfaceWindows.Add({ "Breakpoints", BreakpointsWindowCreate, BreakpointsWindowUpdate });
-	interfaceWindows.Add({ "Registers", RegistersWindowCreate, RegistersWindowUpdate });
-	interfaceWindows.Add({ "Watch", WatchWindowCreate, WatchWindowUpdate, WatchWindowFocus });
-	interfaceWindows.Add({ "Locals", LocalsWindowCreate, WatchWindowUpdate, WatchWindowFocus });
-	interfaceWindows.Add({ "Commands", CommandsWindowCreate, nullptr });
-	interfaceWindows.Add({ "Data", DataWindowCreate, nullptr });
-	interfaceWindows.Add({ "Struct", StructWindowCreate, nullptr });
-	interfaceWindows.Add({ "Files", FilesWindowCreate, nullptr });
-	interfaceWindows.Add({ "Console", ConsoleWindowCreate, nullptr });
-	interfaceWindows.Add({ "Log", LogWindowCreate, nullptr });
-	interfaceWindows.Add({ "Thread", ThreadWindowCreate, ThreadWindowUpdate });
-	interfaceWindows.Add({ "Exe", ExecutableWindowCreate, nullptr });
-	interfaceWindows.Add({ "CmdSearch", CommandSearchWindowCreate, nullptr });
-	interfaceWindows.Add({ "ASM", ASMWindowCreate, ASMWindowUpdate });
+	interfaceWindows.Add({ "Stack",      "Stack",      StackWindowCreate, StackWindowUpdate });
+	interfaceWindows.Add({ "Source",     "Source",     SourceWindowCreate, SourceWindowUpdate });
+	interfaceWindows.Add({ "Breakpoints","Breakpoints",BreakpointsWindowCreate, BreakpointsWindowUpdate });
+	interfaceWindows.Add({ "Registers",  "Registers",  RegistersWindowCreate, RegistersWindowUpdate });
+	interfaceWindows.Add({ "Watch",      "Watch",      WatchWindowCreate, WatchWindowUpdate, WatchWindowFocus });
+	interfaceWindows.Add({ "Locals",     "Locals",     LocalsWindowCreate, WatchWindowUpdate, WatchWindowFocus });
+	interfaceWindows.Add({ "Commands",   "Commands",   CommandsWindowCreate, nullptr });
+	interfaceWindows.Add({ "Data",       "Data",       DataWindowCreate, nullptr });
+	interfaceWindows.Add({ "Struct",     "Struct",     StructWindowCreate, nullptr });
+	interfaceWindows.Add({ "Files",      "Files",      FilesWindowCreate, nullptr });
+	interfaceWindows.Add({ "Console",    "Console",    ConsoleWindowCreate, nullptr });
+	interfaceWindows.Add({ "Log",        "Log",        LogWindowCreate, nullptr });
+	interfaceWindows.Add({ "Thread",     "Thread",     ThreadWindowCreate, ThreadWindowUpdate });
+	interfaceWindows.Add({ "Exe",        "Exe",        ExecutableWindowCreate, nullptr });
+	interfaceWindows.Add({ "CmdSearch",  "CmdSearch",  CommandSearchWindowCreate, nullptr });
+	interfaceWindows.Add({ "ASM",        "ASM",        ASMWindowCreate, ASMWindowUpdate });
 
-	interfaceDataViewers.Add({ "Add bitmap...", BitmapAddDialog });
+	interfaceDataViewers.Add({ T("Add bitmap..."), BitmapAddDialog });
 
 	interfaceCommands.Add({ .label = "Run\tShift+F5",
 			.shortcut = { .code = UI_KEYCODE_FKEY(5), .shift = true, .invoke = CommandSendToGDB, .cp = (void *) "r" } });
@@ -1611,7 +1752,7 @@ void InterfaceAddBuiltinWindowsAndCommands() {
 			.shortcut = { .invoke = CommandAddWatch } });
 	interfaceCommands.Add({ .label = "Inspect line",
 			.shortcut = { .code = UI_KEYCODE_BACKTICK, .invoke = CommandInspectLine } });
-	interfaceCommands.Add({ .label = "Copy Layout to Clipboard", 
+	interfaceCommands.Add({ .label = "Copy Layout to Clipboard",
 			.shortcut = { .invoke = CopyLayoutToClipboard } });
 	interfaceCommands.Add({ .label = nullptr,
 			.shortcut = { .code = UI_KEYCODE_LETTER('E'), .ctrl = true, .invoke = CommandWatchAddEntryForAddress } });
@@ -1636,11 +1777,23 @@ void InterfaceAddBuiltinWindowsAndCommands() {
 void InterfaceShowMenu(void *self) {
 	UIMenu *menu = UIMenuCreate((UIElement *) self, UI_MENU_PLACE_ABOVE | UI_MENU_NO_SCROLL);
 
+	// Dump menu contents to stderr for inspection when GF_DUMP_MENU is set.
+	bool dump = getenv("GF_DUMP_MENU") != nullptr;
+	if (dump) fprintf(stderr, "=== gf2 menu ===\n");
+
+	auto addItem = [&](const char *label, void (*invoke)(void *), void *cp) {
+		const char *translated = T(label);
+		if (dump) fprintf(stderr, "%s\n", translated);
+		UIMenuAddItem(menu, 0, translated, -1, invoke, cp);
+	};
+
 	for (int i = 0; i < interfaceCommands.Length(); i++) {
 		if (!interfaceCommands[i].label) continue;
-		UIMenuAddItem(menu, 0, interfaceCommands[i].label, -1, interfaceCommands[i].shortcut.invoke, interfaceCommands[i].shortcut.cp);
+		addItem(interfaceCommands[i].label, interfaceCommands[i].shortcut.invoke, interfaceCommands[i].shortcut.cp);
 	}
 
+	addItem("Language...", CommandLanguageSetup, nullptr);
+	if (dump) fprintf(stderr, "=== end menu ===\n");
 	UIMenuShow(menu);
 }
 
@@ -1673,7 +1826,7 @@ UIElement *InterfaceWindowSwitchToAndFocus(const char *name) {
 		return window->element;
 	}
 
-	UIDialogShow(windowMain, 0, "Couldn't find the window '%s'.\n%f%B", name, "OK");
+	UIDialogShow(windowMain, 0, T("Couldn't find the window '%s'.\n%f%B"), name, T("OK"));
 	return nullptr;
 }
 
@@ -1781,9 +1934,34 @@ void InterfaceLayoutCreate(UIElement *parent) {
 		InterfaceLayoutNextToken("(");
 		char *copy = strdup(layoutString);
 		for (uintptr_t i = 0; copy[i]; i++) if (copy[i] == ',') copy[i] = '\t'; else if (copy[i] == ')') copy[i] = 0;
-		UIElement *container = &UITabPaneCreate(parent, UI_ELEMENT_V_FILL | UI_ELEMENT_H_FILL, copy)->e;
-		container->messageUser = InterfaceTabPaneMessage;
+
+		// Replace internal window names with localized display names for the tabs.
+		size_t translatedCapacity = strlen(copy) * 8 + 1;
+		char *translated = (char *) calloc(1, translatedCapacity);
+		size_t used = 0;
+		char *source = copy;
+		while (*source) {
+			char *separator = strchr(source, '\t');
+			if (separator) *separator = 0;
+			const char *label = source;
+			for (int j = 0; j < interfaceWindows.Length(); j++) {
+				if (0 == strcmp(source, interfaceWindows[j].name)) {
+					label = T(interfaceWindows[j].displayName ?: interfaceWindows[j].name);
+					break;
+				}
+			}
+			int n = snprintf(translated + used, translatedCapacity - used, "%s", label);
+			if (n > 0) used += (size_t) n < translatedCapacity - used ? (size_t) n : translatedCapacity - used - 1;
+			if (!separator) break;
+			if (used + 1 < translatedCapacity) translated[used++] = '\t';
+			source = separator + 1;
+		}
+		translated[used] = 0;
 		free(copy);
+
+		UIElement *container = &UITabPaneCreate(parent, UI_ELEMENT_V_FILL | UI_ELEMENT_H_FILL, translated)->e;
+		container->messageUser = InterfaceTabPaneMessage;
+		free(translated);
 		InterfaceLayoutCreate(container);
 
 		while (true) {
@@ -1874,14 +2052,18 @@ void CopyLayoutToClipboard(void *cp)
 
 int GfMain(int argc, char **argv) {
 	if (argc == 2 && (0 == strcmp(argv[1], "-?") || 0 == strcmp(argv[1], "-h") || 0 == strcmp(argv[1], "--help"))) {
-		fprintf(stderr, "Usage: %s [GDB args]\n\n"
-			        "GDB args: Pass any GDB arguments here, they will be forwarded to GDB.\n\n"
-				"For more information, view the README at https://github.com/nakst/gf/blob/master/README.md.\n", argv[0]);
+		fprintf(stderr, T("Usage: %s [GDB args]\n\nGDB args: Pass any GDB arguments here, they will be forwarded to GDB.\n\nFor more information, view the README at https://github.com/nakst/gf/blob/master/README.md.\n"), argv[0]);
 		return 1;
 	}
 
 	struct sigaction sigintHandler = {};
-	sigintHandler.sa_handler = [] (int) { DebuggerClose(); exit(0); };
+	// SIGINT must be handled with async-signal-safe operations only. XNextEvent()
+	// cannot be interrupted just by setting ui.quit, so do the minimal cleanup
+	// here: stop GDB and terminate immediately.
+	sigintHandler.sa_handler = [] (int) {
+		if (gdbPID > 0) kill(gdbPID, SIGKILL);
+		_exit(0);
+	};
 	sigaction(SIGINT, &sigintHandler, nullptr);
 
 	gdbArgv = (char **) malloc(sizeof(char *) * (argc + 1));
@@ -1900,23 +2082,49 @@ int GfMain(int argc, char **argv) {
 	StringFormat(localConfigPath, sizeof(localConfigPath), "%s/.project.gf", localConfigDirectory);
 
 	SettingsLoad(true);
+	i18n_init();
 	UIInitialise();
 	//ui.theme = uiThemeDark;
 	ui.theme = uiThemeGruberDarker;
 
 #ifdef UI_FREETYPE
 	if (!fontPath) {
-		// Ask fontconfig for a monospaced font. If this fails, the fallback font will be used.
-		FILE *f = popen("fc-list | grep -F `fc-match mono | awk '{ print($1) }'` "
-				"| awk 'BEGIN { FS = \":\" } ; { print($1) }'", "r");
+		// Prefer a true monospace font with CJK coverage (2:1 advance ratio),
+		// then fall back to Noto Sans Mono CJK. Otherwise use the system mono font.
+		const char *queries[] = {
+			"fc-match -f '%{file}' 'Maple Mono NF CN:lang=zh'",
+			"fc-match -f '%{file}' 'Sarasa Mono SC:lang=zh'",
+			"fc-match -f '%{file}' 'Noto Sans Mono CJK SC:lang=zh'",
+		};
 
-		if (f) {
-			char *buffer = (char *) malloc(PATH_MAX + 1);
-			buffer[fread(buffer, 1, PATH_MAX, f)] = 0;
-			pclose(f);
-			char *newline = strchr(buffer, '\n');
-			if (newline) *newline = 0;
-			fontPath = buffer;
+		for (uintptr_t i = 0; i < sizeof(queries) / sizeof(queries[0]) && !fontPath; i++) {
+			FILE *f = popen(queries[i], "r");
+
+			if (f) {
+				char *buffer = (char *) malloc(PATH_MAX + 1);
+				size_t bytes = fread(buffer, 1, PATH_MAX, f);
+				pclose(f);
+				buffer[bytes] = 0;
+				char *newline = strchr(buffer, '\n');
+				if (newline) *newline = 0;
+				if (*buffer) fontPath = buffer;
+				else free(buffer);
+			}
+		}
+
+		if (!fontPath) {
+			FILE *f = popen("fc-list | grep -F `fc-match mono | awk '{ print($1) }'` "
+					"| awk 'BEGIN { FS = \":\" } ; { print($1) }'", "r");
+
+			if (f) {
+				char *buffer = (char *) malloc(PATH_MAX + 1);
+				size_t bytes = fread(buffer, 1, PATH_MAX, f);
+				pclose(f);
+				buffer[bytes] = 0;
+				char *newline = strchr(buffer, '\n');
+				if (newline) *newline = 0;
+				fontPath = buffer;
+			}
 		}
 	}
 #endif

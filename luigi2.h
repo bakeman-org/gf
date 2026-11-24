@@ -100,8 +100,8 @@ void _UIMessageProcess(EsMessage *message);
 #define _UI_TO_STRING_2(x) _UI_TO_STRING_1(x)
 
 #define UI_SIZE_BUTTON_MINIMUM_WIDTH (100)
-#define UI_SIZE_BUTTON_PADDING (16)
-#define UI_SIZE_BUTTON_HEIGHT (27)
+#define UI_SIZE_BUTTON_PADDING (20)
+#define UI_SIZE_BUTTON_HEIGHT (28)
 #define UI_SIZE_BUTTON_CHECKED_AREA (4)
 
 #define UI_SIZE_CHECKBOX_BOX (14)
@@ -123,8 +123,8 @@ void _UIMessageProcess(EsMessage *message);
 #define UI_SIZE_TEXTBOX_WIDTH (200)
 #define UI_SIZE_TEXTBOX_HEIGHT (27)
 
-#define UI_SIZE_TAB_PANE_SPACE_TOP (2)
-#define UI_SIZE_TAB_PANE_SPACE_LEFT (4)
+#define UI_SIZE_TAB_PANE_SPACE_TOP (3)
+#define UI_SIZE_TAB_PANE_SPACE_LEFT (6)
 
 #define UI_SIZE_SPLITTER (8)
 
@@ -245,6 +245,7 @@ typedef struct UIPainter {
 
 typedef struct UIFont {
 	int glyphWidth, glyphHeight;
+	int cjkAdvance;
 
 #ifdef UI_FREETYPE
 	bool isFreeType;
@@ -1581,9 +1582,43 @@ void UIDrawInvert(UIPainter *painter, UIRectangle rectangle) {
 	}
 }
 
+#ifdef UI_UNICODE
+// East Asian Wide and Fullwidth codepoints occupy two monospace cells.
+int UICharIsWide(int c) {
+	return (c >= 0x1100 && c <= 0x115F)
+		|| (c == 0x2329 || c == 0x232A)
+		|| (c >= 0x2E80 && c <= 0x303E)
+		|| (c >= 0x3040 && c <= 0xA4CF && c != 0x303F)
+		|| (c >= 0xAC00 && c <= 0xD7A3)
+		|| (c >= 0xF900 && c <= 0xFAFF)
+		|| (c >= 0xFE10 && c <= 0xFE19)
+		|| (c >= 0xFE30 && c <= 0xFE6F)
+		|| (c >= 0xFF00 && c <= 0xFF60)
+		|| (c >= 0xFFE0 && c <= 0xFFE6)
+		|| (c >= 0x1F300 && c <= 0x1FAFF)
+		|| (c >= 0x20000 && c <= 0x3FFFD);
+}
+
+int UICharAdvance(UIFont *font, int c) {
+	if (!UICharIsWide(c)) return font->glyphWidth;
+	return font->cjkAdvance ? font->cjkAdvance : font->glyphWidth * 2;
+}
+#else
+int UICharAdvance(UIFont *font, int c) { return font->glyphWidth; }
+#endif
+
 int UIMeasureStringWidth(const char *string, ptrdiff_t bytes) {
 #ifdef UI_UNICODE
-	return Utf8StringLength(string, bytes) * ui.activeFont->glyphWidth;
+	if (bytes == -1) bytes = _UIStringLength(string);
+	int width = 0;
+	ptrdiff_t j = 0;
+	while (j < bytes) {
+		ptrdiff_t consumed = 1;
+		int c = Utf8GetCodePoint(string + j, bytes - j, &consumed);
+		width += UICharAdvance(ui.activeFont, c < 0 ? '?' : c);
+		j += consumed;
+	}
+	return width;
 #else
 	if (bytes == -1) {
 		bytes = _UIStringLength(string);
@@ -1632,14 +1667,16 @@ void UIDrawString(UIPainter *painter, UIRectangle r, const char *string, ptrdiff
 #ifdef UI_UNICODE
 		int c = Utf8GetCodePoint(string, bytes - j, &bytesConsumed);
 		UI_ASSERT(bytesConsumed > 0);
+		if (c < 0) c = '?';
 		string += bytesConsumed;
 #else
 		char c = *string++;
 #endif
 		uint32_t colorText = color;
+		int advance = UICharAdvance(ui.activeFont, c);
 
 		if (i >= selectFrom && i < selectTo) {
-			int w = ui.activeFont->glyphWidth;
+			int w = advance;
 			if (c == '\t') {
 				int ii = i;
 				while (++ii & 3) w += ui.activeFont->glyphWidth;
@@ -1656,7 +1693,7 @@ void UIDrawString(UIPainter *painter, UIRectangle r, const char *string, ptrdiff
 			UIDrawInvert(painter, UI_RECT_4(x, x + 1, y, y + height));
 		}
 
-		x += ui.activeFont->glyphWidth, i++;
+		x += advance, i++;
 
 		if (c == '\t') {
 			while (i & 3) x += ui.activeFont->glyphWidth, i++;
@@ -2906,13 +2943,14 @@ int UIDrawStringHighlighted(UIPainter *painter, UIRectangle lineBounds, const ch
 		}
 
 		int oldX = x;
+		int advance = UICharAdvance(ui.activeFont, c);
 
 		if (c == '\t') {
 			x += ui.activeFont->glyphWidth, ti++;
 			while (ti % tabSize) x += ui.activeFont->glyphWidth, ti++, j++;
 		} else {
 			UIDrawGlyph(painter, x, y, c, colors[tokenType]);
-			x += ui.activeFont->glyphWidth, ti++;
+			x += advance, ti++;
 		}
 
 		if (selection && j >= selection->carets[0] && j < selection->carets[1]) {
@@ -5206,6 +5244,16 @@ UIFont *UIFontCreate(const char *cPath, uint32_t size) {
 			FT_Load_Char(font->font, 'a', FT_LOAD_DEFAULT);
 			font->glyphWidth = font->font->glyph->advance.x / 64;
 			font->glyphHeight = (font->font->size->metrics.ascender - font->font->size->metrics.descender) / 64;
+
+			// Measure the real advance of a fullwidth CJK glyph. Some "mono CJK" fonts
+			// use 1.8x, others exactly 2x; the measured value prevents overlap.
+			if (FT_Load_Char(font->font, 0x4E2D /* 中 */, FT_LOAD_DEFAULT) == 0
+					&& font->font->glyph->advance.x > font->glyphWidth * 64) {
+				font->cjkAdvance = font->font->glyph->advance.x / 64;
+			} else {
+				font->cjkAdvance = font->glyphWidth * 2;
+			}
+
 			font->isFreeType = true;
 			return font;
 		} else
@@ -5215,6 +5263,7 @@ UIFont *UIFontCreate(const char *cPath, uint32_t size) {
 
 	font->glyphWidth = 9;
 	font->glyphHeight = 16;
+	font->cjkAdvance = 18;
 	return font;
 }
 
