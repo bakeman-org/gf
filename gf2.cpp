@@ -36,6 +36,38 @@ extern "C" {
 #include "luigi2.h"
 }
 
+// TODO: gruber darker theme for my own
+UITheme uiThemeGruberDarker = {
+    .panel1 = 0xFF262626,
+    .panel2 = 0xFF181818,
+    .selected = 0xFFFFD866,
+    .border = 0xFF000000,
+
+    .text = 0xFFE4E4E4,
+    .textDisabled = 0xFF535353,
+    .textSelected = 0xFF181818,
+
+    .buttonNormal = 0xFF2C2C2C,
+    .buttonHovered = 0xFF3A3A3A,
+    .buttonPressed = 0xFF101010,
+    .buttonDisabled = 0xFF1F1F1F,
+
+    .textboxNormal = 0xFF242424,
+    .textboxFocused = 0xFF353535,
+
+    .codeFocused = 0xFF353535,
+    .codeBackground = 0xFF181818,
+    .codeDefault = 0xFFE4E4E4,
+    .codeComment = 0xFF535353,
+    .codeString = 0xFFFFD866,
+    .codeNumber = 0xFFA9DC76,
+    .codeOperator = 0xFFFC9867,
+    .codePreprocessor = 0xFFFF6188,
+
+    .accent1 = 0xFF4242,
+    .accent2 = 0xA9DC76,
+};
+
 // Data structures:
 
 template <class T>
@@ -178,8 +210,12 @@ Array<InterfaceDataViewer> interfaceDataViewers;
 Array<ReceiveMessageType> receiveMessageTypes;
 char *layoutString = (char *) "v(75,h(80,Source,v(50,t(Exe,Breakpoints,Commands,Struct),t(Stack,Files,Thread,CmdSearch))),h(65,Console,t(Watch,Locals,Registers,Data)))";
 const char *fontPath;
+// int fontSizeCode = 13;
+// int fontSizeInterface = 11;
+// TODO: Bigger size font for my own
 int fontSizeCode = 13;
-int fontSizeInterface = 11;
+int fontSizeInterface = 18;
+
 float uiScale = 1;
 int uiWidth = 800;
 int uiHeight = 600;
@@ -1865,7 +1901,8 @@ int GfMain(int argc, char **argv) {
 
 	SettingsLoad(true);
 	UIInitialise();
-	ui.theme = uiThemeDark;
+	//ui.theme = uiThemeDark;
+	ui.theme = uiThemeGruberDarker;
 
 #ifdef UI_FREETYPE
 	if (!fontPath) {
